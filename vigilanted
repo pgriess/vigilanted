@@ -1,0 +1,116 @@
+#!/bin/env python
+#
+# A tool to decongest networks.
+#
+# BUGS:
+#
+#   - Piping this to sort doesn't work for some reason, as sending a SIGHUP
+#     to the shell pipeline seems to confuse things and doesn't display any
+#     output to stdout. The error is being reported from Python, I think,
+#     based on the Errno capitalization.
+#
+#       % sudo ./draino | sort -k 2 -n
+#       ^C
+#       saw 1607 packets
+#       close failed: [Errno 32] Broken pipe
+#
+#   - It seems that awk buffers data when streaming to a pipe. Without
+#     letting things collect for a while, we tend to not get any output, even
+#     though tshark indicates on stderr that it saw several hundred packets.
+#
+#   - Stream key should be (client IP, server IP, server port) to
+#     account for client sockets being randomly bound. To do this, we need
+#     to determine who the local client is, as they presumaly initated the
+#     connection.
+#
+#   - Trust time from tshark, not from ourselves, as we see content buffered
+#     from the tshark/awk pipeline and would get rates busted. Tshark gives
+#     very precise timing information anyway.
+
+import os
+import os.path
+import pprint
+import re
+import sys
+import thread
+import time
+
+from optparse import OptionParser
+
+EXECNAME = os.path.basename(sys.argv[0])
+DIRNAME = os.path.dirname(sys.argv[0])
+
+AWK_RE = re.compile(r'^(?P<mac>[^/]{17})/(?P<ip>[\d\.]+):(?P<port>\d+)$')
+
+def tsharkTime(str):
+    '''Parse tshark time strings into epoch seconds (floating point remainder
+       is truncated).'''
+
+    m = re.search('\.\d+$', str)
+    if m:
+        str = str[:m.start()]
+
+    return int(time.mktime(time.strptime(str, '%b %d, %Y %H:%M:%S')))
+
+op = OptionParser(usage='''%prog [options]
+
+Runs the vigilante daemon. Can be run with the -f option to run against
+an existing tshark capture file rather than a live network.'''
+)
+op.add_option(
+    '-f', dest='file', default=None,
+    help='''read from tshark file FILE rather than doing a live capture; should
+            be the result of running "tshark -V"'''
+)
+
+opts, args = op.parse_args()
+
+if opts.file:
+    f = os.popen('awk -f %s/%s.awk %s' % (DIRNAME, EXECNAME, opts.file))
+else:
+    f = os.popen('tshark -i en1 -V -l tcp | awk -f %s/%s.awk' % (DIRNAME, EXECNAME))
+
+stats = {}
+pkts = 0
+try:
+    for l in f:
+        pkts += 1
+
+        # Parse the line into its constituent parts
+        src, dst, pktLen, timeStr = l.strip().split(' ', 3)
+
+        pktLen = int(pktLen)
+        srcMac, srcIp, srcPort = AWK_RE.match(src).groups()
+        dstMac, dstIp, dstPort = AWK_RE.match(dst).groups()
+        ts = tsharkTime(timeStr)
+
+        # Construct a key for the stream out of the two host:port endpoints.
+        # We sort the endpoints lexicographically so that packets flowing in
+        # both directions are accounted for in the same bucket.
+        streamKeyArray = [
+            '%s:%s' % (srcIp, srcPort),
+            '%s:%s' % (dstIp, dstPort)
+        ]
+        streamKeyArray.sort()
+        streamKey = ' '.join(streamKeyArray)
+
+        # We store our stats as an ordered list of (epoch seconds, length)
+        # tuples. We accumulate the length of all packets seen during the
+        # given second into a single tuple (e.g. the length of all packets
+        # seen at 1262881342 are accumulated in the same tuple).
+        if not streamKey in stats:
+            stats[streamKey] = [(ts, pktLen)]
+        else:
+            lastTime, lastLen = stats[streamKey][-1]
+            
+            if lastTime == ts:
+                stats[streamKey][-1] = (lastTime, lastLen + pktLen)
+            else:
+                stats[streamKey].append((ts,  pktLen))
+            
+except KeyboardInterrupt:
+    pass
+sys.stderr.write('\nsaw %d packets\n' % (pkts))
+for sk in stats:
+    print '%s: %s' % (sk, pprint.pformat(stats[sk]))
+f.close()
