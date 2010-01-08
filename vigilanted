@@ -22,10 +22,6 @@
 #     account for client sockets being randomly bound. To do this, we need
 #     to determine who the local client is, as they presumaly initated the
 #     connection.
-#
-#   - Trust time from tshark, not from ourselves, as we see content buffered
-#     from the tshark/awk pipeline and would get rates busted. Tshark gives
-#     very precise timing information anyway.
 
 import os
 import os.path
