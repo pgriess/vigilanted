@@ -40,7 +40,87 @@ from optparse import OptionParser
 EXECNAME = os.path.basename(sys.argv[0])
 DIRNAME = os.path.dirname(sys.argv[0])
 
-AWK_RE = re.compile(r'^(?P<mac>[^/]{17})/(?P<ip>[\d\.]+):(?P<port>\d+)$')
+class Stream:
+    '''Class to represent a stream, and compute bandwidth consumption'''
+
+    def __init__(self, pkt, window = 60):
+        '''Construct a stream from a single packet. The 'window' parameter
+           specifies how far back in history to go (in seconds) when
+           computing the bandwidth used.'''
+
+        self.__window = float(window)
+        self.__bandwidthHistory = []
+        self.__bandwidth = 0.0
+
+        self.mac1 = pkt.srcMac
+        self.ip1 = pkt.srcIp
+        self.port1 = int(pkt.srcPort)
+
+        self.mac2 = pkt.dstMac
+        self.ip2 = pkt.dstIp
+        self.port2 = int(pkt.dstPort)
+
+    def __str__(self):
+        return '%s/%s:%d <-> %s/%s:%d %fkB/s' % (
+            self.mac1, self.ip1, self.port1,
+            self.mac2, self.ip2, self.port2,
+            self.__bandwidth
+        )
+
+    def getBandwidth(self):
+        return self.__bandwidth
+
+    def addPacket(self, pkt):
+        '''Add a packet to the stream'''
+
+        if len(self.__bandwidthHistory) == 0:
+            self.__bandwidthHistory = [(pkt.ts, pkt.len)]
+        else:
+            lastTime, lastLen = self.__bandwidthHistory[-1]
+
+            assert (pkt.ts >= lastTime)
+
+            if lastTime == pkt.ts:
+                self.__bandwidthHistory[-1] = (lastTime, lastLen + pkt.len)
+            else:
+                self.__bandwidthHistory.append((pkt.ts, pkt.len))
+
+        self.__recomputeBandwidth()
+
+    def __recomputeBandwidth(self):
+        '''Re-compute bandwidth usage of the stream over the window'''
+
+        if (self.__bandwidthHistory[-1][0] - self.__bandwidthHistory[0][0]) <= self.__window:
+            last = self.__bandwidthHistory[-1][0] - self.__window
+            self.__bandwidthHistory = filter(
+                lambda x : x[0] >= last,
+                self.__bandwidthHistory
+            )
+
+        used = reduce(
+            lambda x, y: x + y[1],
+            self.__bandwidthHistory,
+            0
+        )
+
+        self.__bandwidth = (used / 1024) / self.__window
+
+class Packet:
+    '''Class to represent a single packet as seen on the network'''
+
+    AWK_RE = re.compile(r'^(?P<mac>[^/]{17})/(?P<ip>[\d\.]+):(?P<port>\d+)$')
+
+    def __init__(self, str):
+        '''Construct a packet from a specification string.'''
+
+        # Parse the line into its constituent parts
+        src, dst, pktLen, timeStr = l.strip().split(' ', 3)
+
+        # Parse the individual tuples into something useful
+        self.len = int(pktLen)
+        self.srcMac, self.srcIp, self.srcPort = Packet.AWK_RE.match(src).groups()
+        self.dstMac, self.dstIp, self.dstPort = Packet.AWK_RE.match(dst).groups()
+        self.ts = tsharkTime(timeStr)
 
 def tsharkTime(str):
     '''Parse tshark time strings into epoch seconds (floating point remainder
@@ -70,26 +150,20 @@ if opts.file:
 else:
     f = os.popen('tshark -i en1 -V -l tcp | awk -f %s/%s.awk' % (DIRNAME, EXECNAME))
 
-stats = {}
+streams = {}
 pkts = 0
 try:
     for l in f:
         pkts += 1
 
-        # Parse the line into its constituent parts
-        src, dst, pktLen, timeStr = l.strip().split(' ', 3)
-
-        pktLen = int(pktLen)
-        srcMac, srcIp, srcPort = AWK_RE.match(src).groups()
-        dstMac, dstIp, dstPort = AWK_RE.match(dst).groups()
-        ts = tsharkTime(timeStr)
+        pkt = Packet(l)
 
         # Construct a key for the stream out of the two host:port endpoints.
         # We sort the endpoints lexicographically so that packets flowing in
         # both directions are accounted for in the same bucket.
         streamKeyArray = [
-            '%s:%s' % (srcIp, srcPort),
-            '%s:%s' % (dstIp, dstPort)
+            '%s:%s' % (pkt.srcIp, pkt.srcPort),
+            '%s:%s' % (pkt.dstIp, pkt.dstPort)
         ]
         streamKeyArray.sort()
         streamKey = ' '.join(streamKeyArray)
@@ -98,19 +172,14 @@ try:
         # tuples. We accumulate the length of all packets seen during the
         # given second into a single tuple (e.g. the length of all packets
         # seen at 1262881342 are accumulated in the same tuple).
-        if not streamKey in stats:
-            stats[streamKey] = [(ts, pktLen)]
+        if not streamKey in streams:
+            streams[streamKey] = Stream(pkt)
         else:
-            lastTime, lastLen = stats[streamKey][-1]
-            
-            if lastTime == ts:
-                stats[streamKey][-1] = (lastTime, lastLen + pktLen)
-            else:
-                stats[streamKey].append((ts,  pktLen))
+            streams[streamKey].addPacket(pkt)
             
 except KeyboardInterrupt:
     pass
-sys.stderr.write('\nsaw %d packets\n' % (pkts))
-for sk in stats:
-    print '%s: %s' % (sk, pprint.pformat(stats[sk]))
+print '>> saw %d packets' % (pkts)
+for sk, stream in streams.iteritems():
+    print stream
 f.close()
