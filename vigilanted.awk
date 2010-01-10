@@ -1,4 +1,4 @@
-# An gawk(1) file to display statistics for a packet trace based on
+# An awk(1) file to display statistics for a packet trace based on
 # tshark(1) output.
 #
 # Expected usage is:
@@ -10,28 +10,21 @@
 # 22:27:33.999993000"), and so goes at the end of the line to (slightly)
 # ease parsing.
 #
-#   <src MAC>/<src IP>:<src port> <dst MAC>/<dst IP>:<dst port> <pkt sz> <timestamp>
-#
-# The basic flow of this script is to note interesting fields by line
-# signature (e.g. 'Source port') and make sure it's in the right section
-# (the most recent line without any indentation). We accumulate values in
-# variables, and print them out when we see a new frame.
+#   <src MAC>/<src IP>:<src port> <dst MAC>/<dst IP>:<dst port> <pkt sz> <tcpSeq> <tcpAck> <tcpLen> <timestamp>
 
+# Frame 1 (1514 bytes on wire, 1514 bytes captured)
 /^Frame [[:digit:]]+/ {
     # If we have a valid record, print it out
     if (time != "" &&
         srcMac != "" && srcIp != "" && srcPort != "" &&
         dstMac != "" && dstIp != "" && dstPort != "")
-        printf("%s/%s:%s %s/%s:%s %d %s\n", srcMac, srcIp, srcPort, dstMac, dstIp, dstPort, pktLen, time)
+        printf("%s/%s:%s %s/%s:%s %d %d %d %d %s\n", srcMac, srcIp, srcPort, dstMac, dstIp, dstPort, pktLen, tcpSeq, tcpAck, tcpLen, time)
+        fflush()
 
+    pktLen = substr($3, 2, length($3) - 1)
     srcMac = srcIp = srcPort = ""
     dstMac = dstIp = dstPort = ""
-}
-
-# Match the section name of any given packet. Use this to disambiguate
-# between fields which may exist in multiple sections.
-/^[[:alnum:]]+ / {
-    sectionName = $1
+    tcpSeq = tcpAck = tcpLen = ""
 }
 
 /^    Arrival Time: / {
@@ -50,23 +43,11 @@
     dstMac = substr($8, 2, length($8) - 2)
 }
 
-# Frame Length: 125123
-/^    Frame Length: / {
-    pktLen = $3
-}
-
-# Source port: http (80)
-/^    Source port: / {
-    if (sectionName != "Transmission")
-        next
-
-    srcPort = substr($4, 2, length($4) - 2)
-}
-
-# Destination port: http (80)
-/^    Destination port: / {
-    if (sectionName != "Transmission")
-        next
-
-    dstPort = substr($4, 2, length($4) - 2)
+# Transmission Control Protocol, Src Port: http (80), Dst Port: 60823 (60823), Seq: 1, Ack: 1, Len: 1448
+/^Transmission Control Protocol, Src Port: / {
+    srcPort = substr($7, 2, length($7) - 3)
+    dstPort = substr($11, 2, length($11) - 3)
+    tcpSeq = substr($13, 1, length($13) - 1)
+    tcpAck = substr($15, 1, length($15) - 1)
+    tcpLen = $17
 }

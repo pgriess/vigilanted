@@ -22,13 +22,19 @@
 #     account for client sockets being randomly bound. To do this, we need
 #     to determine who the local client is, as they presumaly initated the
 #     connection.
+#
+#   - The delay / buffering in the "tshark | awk" pipeline is going to make
+#     it very difficult to truncate TCP connections, as we're likely to have
+#     seen the packets too late to modify the stream.
 
+import dpkt
+import fcntl
 import os
 import os.path
-import pprint
 import re
+import socket
+import struct
 import sys
-import thread
 import time
 
 from optparse import OptionParser
@@ -37,7 +43,7 @@ EXECNAME = os.path.basename(sys.argv[0])
 DIRNAME = os.path.dirname(sys.argv[0])
 
 class Stream:
-    '''Class to represent a stream, and compute bandwidth consumption'''
+    '''Class to represent a TCP stream, and compute bandwidth consumption'''
 
     def __init__(self, pkt, window = 60):
         '''Construct a stream from a single packet. The 'window' parameter
@@ -47,27 +53,36 @@ class Stream:
         self.__window = float(window)
         self.__bandwidthHistory = []
         self.__bandwidth = 0.0
+        self.__numPackets = 0
 
         self.mac1 = pkt.srcMac
         self.ip1 = pkt.srcIp
-        self.port1 = int(pkt.srcPort)
+        self.port1 = pkt.srcPort
+        self.seq1 = -1
+        self.ack1 = -1
 
         self.mac2 = pkt.dstMac
         self.ip2 = pkt.dstIp
-        self.port2 = int(pkt.dstPort)
+        self.port2 = pkt.dstPort
+        self.seq2 = -1
+        self.ack2 = -1
 
     def __str__(self):
-        return '%s/%s:%d <-> %s/%s:%d %fkB/s' % (
-            self.mac1, self.ip1, self.port1,
-            self.mac2, self.ip2, self.port2,
+        return '%s/%s:%d(%d,%d) <-> %s/%s:%d(%d,%d) %fkB/s' % (
+            self.mac1, self.ip1, self.port1, self.seq1, self.ack1,
+            self.mac2, self.ip2, self.port2, self.seq2, self.ack2,
             self.__bandwidth
         )
 
     def getBandwidth(self):
+        '''Get the computed bandwidth usage over the time window'''
+
         return self.__bandwidth
 
     def addPacket(self, pkt):
         '''Add a packet to the stream'''
+
+        self.__numPackets += 1
 
         if len(self.__bandwidthHistory) == 0:
             self.__bandwidthHistory = [(pkt.ts, pkt.len)]
@@ -81,7 +96,72 @@ class Stream:
             else:
                 self.__bandwidthHistory.append((pkt.ts, pkt.len))
 
+        if pkt.srcIp == self.ip1:
+            self.seq1 = max(self.seq1, pkt.tcpSeq + pkt.tcpLen)
+            self.ack1 = max(self.ack1, pkt.tcpAck)
+        else:
+            self.seq2 = max(self.seq2, pkt.tcpSeq + pkt.tcpLen)
+            self.ack2 = max(self.ack2, pkt.tcpAck)
+
         self.__recomputeBandwidth()
+
+    def kill(self):
+        '''Kill this stream'''
+
+        print 'killing ' + str(self)
+
+        fd = -1
+        for i in range(0, 4):
+            try:
+                fd = os.open('/dev/bpf' + str(i), os.O_RDWR)
+            except OSError:
+                continue
+
+            break
+
+        if fd == -1:
+            raise OSError, 'Failed to open /dev/bpf*'
+
+        # NOTE: On my host, BIOCSETIF = 0x8020426c
+        ifreq = struct.pack('16s', 'en1')
+        err = fcntl.ioctl(fd, 0x8020426c, ifreq)
+        if err < 0:
+            os.close(fd)
+            raise OSError, 'ioctl(): ' + err
+
+        try:
+            data = 'killed by vigilanted'
+
+            tcp = dpkt.tcp.TCP(
+                sport = self.port1,
+                dport = self.port2,
+                seq = self.seq1 + 1,
+                ack = self.ack1,
+                flags = dpkt.tcp.TH_FIN,
+            )
+            tcp.data = data
+
+            ip = dpkt.ip.IP(
+                p = 6,
+                src = socket.inet_aton(self.ip1),
+                dst = socket.inet_aton(self.ip2)
+            )
+            ip.data = tcp
+            ip.len += len(ip.data)
+
+            eth = dpkt.ethernet.Ethernet(
+                src = eth_aton(self.mac1),
+                dst = eth_aton(self.mac2)
+            )
+            eth.data = ip
+
+            buf = str(eth)
+            buflen = len(buf)
+            err = os.write(fd, buf)
+            
+            assert(err == buflen)
+        finally:
+            os.close(fd)
 
     def __recomputeBandwidth(self):
         '''Re-compute bandwidth usage of the stream over the window'''
@@ -102,80 +182,109 @@ class Stream:
         self.__bandwidth = (used / 1024) / self.__window
 
 class Packet:
-    '''Class to represent a single packet as seen on the network'''
+    '''Class to represent a single TCP packet as seen on the network'''
 
     AWK_RE = re.compile(r'^(?P<mac>[^/]{17})/(?P<ip>[\d\.]+):(?P<port>\d+)$')
 
-    def __init__(self, str):
+    def __init__(self, s):
         '''Construct a packet from a specification string.'''
 
         # Parse the line into its constituent parts
-        src, dst, pktLen, timeStr = l.strip().split(' ', 3)
+        src, dst, pktSz, tcpSeq, tcpAck, tcpLen, timeStr = s.strip().split(' ', 6)
 
         # Parse the individual tuples into something useful
-        self.len = int(pktLen)
-        self.srcMac, self.srcIp, self.srcPort = Packet.AWK_RE.match(src).groups()
-        self.dstMac, self.dstIp, self.dstPort = Packet.AWK_RE.match(dst).groups()
-        self.ts = tsharkTime(timeStr)
+        self.len = int(pktSz)
+        self.srcMac, self.srcIp, srcPort = Packet.AWK_RE.match(src).groups()
+        self.dstMac, self.dstIp, dstPort = Packet.AWK_RE.match(dst).groups()
+        self.ts = self.__parseTime(timeStr)
 
-def tsharkTime(str):
-    '''Parse tshark time strings into epoch seconds (floating point remainder
-       is truncated).'''
+        self.srcPort = int(srcPort)
+        self.dstPort = int(dstPort)
+        self.tcpSeq = int(tcpSeq)
+        self.tcpAck = int(tcpAck)
+        self.tcpLen = int(tcpLen)
 
-    m = re.search('\.\d+$', str)
-    if m:
-        str = str[:m.start()]
+    def __str__(self):
+        return '[%d] %s/%s:%d(%d+%d,%d) %s/%s:%d' % (
+            self.ts,
+            self.srcMac, self.srcIp, self.srcPort, self.tcpSeq, self.tcpLen,
+                self.tcpAck,
+            self.dstMac, self.dstIp, self.dstPort
+        )
 
-    return int(time.mktime(time.strptime(str, '%b %d, %Y %H:%M:%S')))
+    def __parseTime(self, s):
+        '''Parse tshark time strings into epoch seconds (floating point remainder
+           is truncated).'''
 
-op = OptionParser(usage='''%prog [options]
+        m = re.search('\.\d+$', s)
+        if m:
+            s= s[:m.start()]
 
-Runs the vigilante daemon. Can be run with the -f option to run against
-an existing tshark capture file rather than a live network.'''
-)
-op.add_option(
-    '-f', dest='file', default=None,
-    help='''read from tshark file FILE rather than doing a live capture; should
-            be the result of running "tshark -V"'''
-)
+        return int(time.mktime(time.strptime(s, '%b %d, %Y %H:%M:%S')))
 
-opts, args = op.parse_args()
+def eth_aton(mac):
+    '''Convert a MAC address of XX:XX:XX:XX:XX:XX to a byte string.'''
 
-if opts.file:
-    f = os.popen('awk -f %s/%s.awk %s' % (DIRNAME, EXECNAME, opts.file))
-else:
-    f = os.popen('tshark -i en1 -V -l tcp | awk -f %s/%s.awk' % (DIRNAME, EXECNAME))
+    octets = map(
+        lambda x: int(x, 16),
+        mac.split(':')
+    )
+    return struct.pack('!BBBBBB', *octets)
 
-streams = {}
-pkts = 0
-try:
-    for l in f:
-        pkts += 1
+if __name__ == '__main__':
+    op = OptionParser(usage='''%prog [options]
 
-        pkt = Packet(l)
+    Runs the vigilante daemon. Can be run with the -f option to run against
+    an existing tshark capture file rather than a live network.'''
+    )
+    op.add_option(
+        '-f', dest='file', default=None,
+        help='''read from tshark file FILE rather than doing a live capture; should
+                be the result of running "tshark -V"'''
+    )
 
-        # Construct a key for the stream out of the two host:port endpoints.
-        # We sort the endpoints lexicographically so that packets flowing in
-        # both directions are accounted for in the same bucket.
-        streamKeyArray = [
-            '%s:%s' % (pkt.srcIp, pkt.srcPort),
-            '%s:%s' % (pkt.dstIp, pkt.dstPort)
-        ]
-        streamKeyArray.sort()
-        streamKey = ' '.join(streamKeyArray)
+    opts, args = op.parse_args()
 
-        # We store our stats as an ordered list of (epoch seconds, length)
-        # tuples. We accumulate the length of all packets seen during the
-        # given second into a single tuple (e.g. the length of all packets
-        # seen at 1262881342 are accumulated in the same tuple).
-        if not streamKey in streams:
-            streams[streamKey] = Stream(pkt)
-        else:
-            streams[streamKey].addPacket(pkt)
-            
-except KeyboardInterrupt:
-    pass
-print '>> saw %d packets' % (pkts)
-for sk, stream in streams.iteritems():
-    print stream
-f.close()
+    if opts.file:
+        f = os.popen('awk -f %s/%s.awk %s' % (DIRNAME, EXECNAME, opts.file))
+    else:
+        f = os.popen('tshark -i en1 -V -l tcp | awk -f %s/%s.awk' % (DIRNAME, EXECNAME))
+
+    streams = {}
+    pkts = 0
+    try:
+        for l in f:
+            pkts += 1
+
+            pkt = Packet(l)
+
+            # Construct a key for the stream out of the two host:port endpoints.
+            # We sort the endpoints lexicographically so that packets flowing in
+            # both directions are accounted for in the same bucket.
+            streamKeyArray = [
+                '%s:%s' % (pkt.srcIp, pkt.srcPort),
+                '%s:%s' % (pkt.dstIp, pkt.dstPort)
+            ]
+            streamKeyArray.sort()
+            streamKey = ' '.join(streamKeyArray)
+
+            # Track streams by stream key, appending found packets to the stream
+            # and taking action if the stream exceeds our quota.
+            if not streamKey in streams:
+                streams[streamKey] = s = Stream(pkt)
+            else:
+                s = streams[streamKey]
+
+            s.addPacket(pkt)
+
+            if s.getBandwidth() > 3:
+                s.kill()
+
+    except KeyboardInterrupt:
+        pass
+    print '>> saw %d packets' % (pkts)
+    for sk, stream in streams.iteritems():
+        print stream
+    f.close()
+
+# vim:tabstop=4 shiftwidth=4 expandtab
