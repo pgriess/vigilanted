@@ -311,6 +311,5 @@ if __name__ == '__main__':
     print '>> saw %d packets' % (npkts)
     for sk, stream in streams.iteritems():
         print stream
-    f.close()
 
 # vim:tabstop=4 shiftwidth=4 expandtab
