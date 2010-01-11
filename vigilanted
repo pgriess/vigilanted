@@ -31,6 +31,7 @@ import dpkt
 import fcntl
 import os
 import os.path
+import pcap
 import re
 import socket
 import struct
@@ -68,7 +69,7 @@ class Stream:
         self.ack2 = -1
 
     def __str__(self):
-        return '%s/%s:%d(%d,%d) <-> %s/%s:%d(%d,%d) %fkB/s' % (
+        return '%s/%s:%d(%d,%d) <-> %s/%s:%d(%d,%d) %f kB/s' % (
             self.mac1, self.ip1, self.port1, self.seq1, self.ack1,
             self.mac2, self.ip2, self.port2, self.seq2, self.ack2,
             self.__bandwidth
@@ -184,25 +185,26 @@ class Stream:
 class Packet:
     '''Class to represent a single TCP packet as seen on the network'''
 
-    AWK_RE = re.compile(r'^(?P<mac>[^/]{17})/(?P<ip>[\d\.]+):(?P<port>\d+)$')
+    def __init__(self, ts, dp):
+        '''Construct a Packet class from a the given dkpt packet'''
 
-    def __init__(self, s):
-        '''Construct a packet from a specification string.'''
+        self.ts = int(ts)
+        self.len = dp.data.len
 
-        # Parse the line into its constituent parts
-        src, dst, pktSz, tcpSeq, tcpAck, tcpLen, timeStr = s.strip().split(' ', 6)
+        # Ethernet
+        self.srcMac = eth_ntoa(dp.src)
+        self.dstMac = eth_ntoa(dp.dst)
 
-        # Parse the individual tuples into something useful
-        self.len = int(pktSz)
-        self.srcMac, self.srcIp, srcPort = Packet.AWK_RE.match(src).groups()
-        self.dstMac, self.dstIp, dstPort = Packet.AWK_RE.match(dst).groups()
-        self.ts = self.__parseTime(timeStr)
+        # IP
+        self.srcIp = socket.inet_ntoa(dp.data.src)
+        self.dstIp = socket.inet_ntoa(dp.data.dst)
 
-        self.srcPort = int(srcPort)
-        self.dstPort = int(dstPort)
-        self.tcpSeq = int(tcpSeq)
-        self.tcpAck = int(tcpAck)
-        self.tcpLen = int(tcpLen)
+        # TCP
+        self.srcPort = dp.data.data.sport
+        self.dstPort = dp.data.data.dport
+        self.tcpSeq = dp.data.data.seq
+        self.tcpAck = dp.data.data.ack
+        self.tcpLen = len(dp.data.data.data)
 
     def __str__(self):
         return '[%d] %s/%s:%d(%d+%d,%d) %s/%s:%d' % (
@@ -223,13 +225,30 @@ class Packet:
         return int(time.mktime(time.strptime(s, '%b %d, %Y %H:%M:%S')))
 
 def eth_aton(mac):
-    '''Convert a MAC address of XX:XX:XX:XX:XX:XX to a byte string.'''
+    '''Convert a MAC address of XX:XX:XX:XX:XX:XX to a byte string'''
 
     octets = map(
         lambda x: int(x, 16),
         mac.split(':')
     )
     return struct.pack('!BBBBBB', *octets)
+
+def eth_ntoa(mac):
+    '''Convert a byte string into a human-readable MAC address'''
+
+    def octet2hex(o):
+        x = hex(o)[2:]
+
+        if len(x) == 1:
+            return '0' + str(x)
+        else:
+            return x
+
+    return reduce(
+        lambda x, y: x + ':' + octet2hex(y),
+        struct.unpack('!BBBBBB', mac),
+        ''
+    )[1:]
 
 if __name__ == '__main__':
     op = OptionParser(usage='''%prog [options]
@@ -238,25 +257,32 @@ if __name__ == '__main__':
     an existing tshark capture file rather than a live network.'''
     )
     op.add_option(
-        '-f', dest='file', default=None,
-        help='''read from tshark file FILE rather than doing a live capture; should
-                be the result of running "tshark -V"'''
+        '-r', dest='file', default=None,
+        help='''read from the given pcap(3) file rather than doing a live
+                capture, which is the default'''
+    )
+    op.add_option(
+        '-i', dest='interface', default='en1',
+        help='''set the name of the interface on which to sniff (default:
+                %default)'''
     )
 
     opts, args = op.parse_args()
 
     if opts.file:
-        f = os.popen('awk -f %s/%s.awk %s' % (DIRNAME, EXECNAME, opts.file))
+        pc = pcap.pcap(name = opts.file)
     else:
-        f = os.popen('tshark -i en1 -V -l tcp | awk -f %s/%s.awk' % (DIRNAME, EXECNAME))
+        pc = pcap.pcap(name = opts.interface, immediate = True)
 
+    pc.setfilter('tcp')
     streams = {}
-    pkts = 0
+    npkts = 0
     try:
-        for l in f:
-            pkts += 1
-
-            pkt = Packet(l)
+        for ts, pcp in pc:
+            npkts += 1
+            
+            dp = dpkt.ethernet.Ethernet(pcp)
+            pkt = Packet(ts, dp)
 
             # Construct a key for the stream out of the two host:port endpoints.
             # We sort the endpoints lexicographically so that packets flowing in
@@ -282,7 +308,7 @@ if __name__ == '__main__':
 
     except KeyboardInterrupt:
         pass
-    print '>> saw %d packets' % (pkts)
+    print '>> saw %d packets' % (npkts)
     for sk, stream in streams.iteritems():
         print stream
     f.close()
