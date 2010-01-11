@@ -214,16 +214,6 @@ class Packet:
             self.dstMac, self.dstIp, self.dstPort
         )
 
-    def __parseTime(self, s):
-        '''Parse tshark time strings into epoch seconds (floating point remainder
-           is truncated).'''
-
-        m = re.search('\.\d+$', s)
-        if m:
-            s= s[:m.start()]
-
-        return int(time.mktime(time.strptime(s, '%b %d, %Y %H:%M:%S')))
-
 def eth_aton(mac):
     '''Convert a MAC address of XX:XX:XX:XX:XX:XX to a byte string'''
 
