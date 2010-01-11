@@ -4,28 +4,10 @@
 #
 # BUGS:
 #
-#   - Piping this to sort doesn't work for some reason, as sending a SIGHUP
-#     to the shell pipeline seems to confuse things and doesn't display any
-#     output to stdout. The error is being reported from Python, I think,
-#     based on the Errno capitalization.
-#
-#       % sudo ./draino | sort -k 2 -n
-#       ^C
-#       saw 1607 packets
-#       close failed: [Errno 32] Broken pipe
-#
-#   - It seems that awk buffers data when streaming to a pipe. Without
-#     letting things collect for a while, we tend to not get any output, even
-#     though tshark indicates on stderr that it saw several hundred packets.
-#
 #   - Stream key should be (client IP, server IP, server port) to
 #     account for client sockets being randomly bound. To do this, we need
 #     to determine who the local client is, as they presumaly initated the
 #     connection.
-#
-#   - The delay / buffering in the "tshark | awk" pipeline is going to make
-#     it very difficult to truncate TCP connections, as we're likely to have
-#     seen the packets too late to modify the stream.
 
 import dpkt
 import fcntl
